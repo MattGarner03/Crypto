@@ -1,19 +1,19 @@
 # BitcoinConfluence.py
-# deps: pip install -U ccxt yfinance pandas numpy scipy matplotlib
+# deps: pip install -U pandas numpy scipy matplotlib
 
 import math
 import warnings
 from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import ccxt
-import yfinance as yf
 from scipy.signal import argrelextrema
 
 warnings.filterwarnings("ignore")
 
 # ----------------- Parameters -----------------
-START  = "2017-01-01"     # CME starts 2017; Bybit spot/perp has later start, it's fine
+START  = "2017-01-01"     # earliest date we attempt to load from cached Binance data
 END    = None
 SPLIT  = "2021-01-01"     # In-sample / Out-of-sample split (edit as you like)
 
@@ -26,33 +26,45 @@ COST   = FEE + SLIP
 
 SWING_WIN   = 60          # days to detect last swing high/low
 ATR_WIN     = 14
-ENTRY_SCORE = 3           # confluence needed to enter (sum of booleans)
+ENTRY_SCORE = 2           # confluence needed to enter (sum of booleans)
 ATR_STOP_MULT = 1.5       # stop distance in ATR if structural stop not available
 
+if "__file__" in globals():
+    _BASE_DIR = Path(__file__).resolve().parent
+else:
+    _BASE_DIR = Path.cwd()
+DATA_DIR = _BASE_DIR / "data"
+TIMEFRAME_DIRS = {
+    "1d": DATA_DIR,
+    "1h": _BASE_DIR / "data_1h",
+    "4h": _BASE_DIR / "data_4h",
+}
+
+
 # ----------------- Data -----------------
-def fetch_bybit_daily(symbols: list[str]) -> pd.DataFrame:
+def fetch_binance_daily(symbols: list[str], timeframe: str = "1d") -> pd.DataFrame:
     """
-    Fetch daily OHLCV from Bybit via CCXT for given symbols.
+    Load daily OHLCV from cached CSVs produced by fetch_binance_top10.py.
     Returns DataFrame with MultiIndex columns: (symbol, field).
     """
-    ex = ccxt.bybit({"enableRateLimit": True})
-    ex.load_markets()
-    frames = []
+    tf_dir = TIMEFRAME_DIRS.get(timeframe)
+    if tf_dir is None:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'. Available: {', '.join(TIMEFRAME_DIRS)}")
+    frames: list[pd.DataFrame] = []
     for sym in symbols:
-        if sym not in ex.markets:
-            continue
-        ohlcv = ex.fetch_ohlcv(sym, timeframe="1d", since=None, limit=2000)
-        if not ohlcv:
-            continue
-        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-        # detect ms vs s
-        unit = "ms" if df["ts"].max() > 10**12 else "s"
-        df["ts"] = pd.to_datetime(df["ts"], unit=unit, utc=True)
-        df.set_index("ts", inplace=True)
+        csv_name = sym.replace("/", "") + ".csv"
+        path = tf_dir / csv_name
+        if not path.exists():
+            raise FileNotFoundError(f"Cached data not found for {sym}. Expected file: {path}")
+        df = pd.read_csv(path, parse_dates=["open_time"])
+        df = df.rename(columns=str.lower)
+        df.set_index("open_time", inplace=True)
         if getattr(df.index, "tz", None) is not None:
-            df.index = df.index.tz_convert(None)  # make tz-naive
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
         df.columns = pd.MultiIndex.from_product([[sym], df.columns])
         frames.append(df)
+        print(f"[cache] Loaded {sym} ({timeframe}) from {path}")
 
     if not frames:
         return pd.DataFrame()
@@ -60,7 +72,7 @@ def fetch_bybit_daily(symbols: list[str]) -> pd.DataFrame:
 
 def pick_btc_symbol(exframe: pd.DataFrame) -> str:
     """Prefer USD perp; else USD spot; else USDT."""
-    candidates = ["BTC/USD:USD", "BTC/USD", "BTC/USDT"]
+    candidates = ["BTC/USDT", "BTC/BUSD", "BTC/USDC", "BTC/FDUSD"]
     for c in candidates:
         if (c, "close") in exframe.columns:
             return c
@@ -69,16 +81,7 @@ def pick_btc_symbol(exframe: pd.DataFrame) -> str:
     for s in symbols:
         if s.startswith("BTC/"):
             return s
-    raise RuntimeError("No BTC symbols found in Bybit data.")
-
-def get_cme_daily(start, end) -> pd.DataFrame:
-    """Yahoo CME Bitcoin futures (BTC=F)."""
-    df = yf.download("BTC=F", start=start, end=end, auto_adjust=True, progress=False)
-    if df.empty:
-        raise RuntimeError("Could not fetch BTC=F (CME) from Yahoo.")
-    if getattr(df.index, "tz", None) is not None:
-        df.index = df.index.tz_localize(None)
-    return df.rename(columns=str.lower)
+    raise RuntimeError("No BTC symbols found in Binance data.")
 
 # ----------------- Indicators -----------------
 def rolling_atr(df: pd.DataFrame, win: int = ATR_WIN) -> pd.Series:
@@ -199,25 +202,21 @@ def golden_pocket_from_swing(lo_px: float, hi_px: float, uptrend: bool) -> tuple
         gp_high = lo + 0.65  * span
     return float(min(gp_low, gp_high)), float(max(gp_low, gp_high))
 
-def cme_unfilled_gaps(cme_df: pd.DataFrame) -> list[tuple[pd.Timestamp, float, float, str]]:
-    """List gaps: (date, hi, lo, type='up' or 'down'). We treat them as magnets/targets."""
-    gaps = []
-    for i in range(1, len(cme_df)):
-        prev = cme_df.iloc[i-1]; cur = cme_df.iloc[i]
-        if cur["low"] > prev["high"]:   # gap up
-            gaps.append((cme_df.index[i], prev["high"], cur["low"], "up"))
-        elif cur["high"] < prev["low"]: # gap down
-            gaps.append((cme_df.index[i], cur["high"], prev["low"], "down"))
-    return gaps
-
 # ----------------- Build feature set -----------------
-def build_btc_frame() -> pd.DataFrame:
-    # try Bybit USD perp → USD spot → USDT spot
-    bybit = fetch_bybit_daily(["BTC/USD:USD", "BTC/USD", "BTC/USDT"])
-    if bybit.empty:
-        raise RuntimeError("Bybit data unavailable via CCXT.")
-    sym = pick_btc_symbol(bybit)
-    df = bybit[sym].copy()
+def build_btc_frame(timeframe: str = "1d") -> pd.DataFrame:
+    # try Binance USD spot variations (only those cached locally)
+    preferred = ["BTC/USDT", "BTC/BUSD", "BTC/USDC", "BTC/FDUSD"]
+    data_dir = TIMEFRAME_DIRS.get(timeframe)
+    if data_dir is None:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'. Available: {', '.join(TIMEFRAME_DIRS)}")
+    available = [s for s in preferred if (data_dir / (s.replace("/", "") + ".csv")).exists()]
+    if not available:
+        raise RuntimeError(f"No cached Binance data found for BTC in {data_dir}. Run fetch_binance_top10.py first.")
+    binance = fetch_binance_daily(available, timeframe=timeframe)
+    if binance.empty:
+        raise RuntimeError("Cached Binance data for BTC returned empty frame.")
+    sym = pick_btc_symbol(binance)
+    df = binance[sym].copy()
     df = df.loc[df.index >= pd.Timestamp(START)]
     if END:
         df = df.loc[df.index <= pd.Timestamp(END)]
@@ -263,20 +262,9 @@ def build_btc_frame() -> pd.DataFrame:
         df[f"w_{col}"] = wk[col].shift().reindex(df.index).ffill()
 
     # Monthly (month-end)
-    mo = df.resample("ME").agg({"open":"first","high":"max","low":"min","close":"last"})
+    mo = df.resample("M").agg({"open":"first","high":"max","low":"min","close":"last"})
     for col in ["open","high","low","close"]:
         df[f"m_{col}"] = mo[col].shift().reindex(df.index).ffill()
-
-    # CME gaps -> nearest mid above/below
-    cme = get_cme_daily(START, END)
-    gaps = cme_unfilled_gaps(cme)
-    gap_above, gap_below = [], []
-    for ts, row in df.iterrows():
-        mids_up   = [ (hi+lo)/2 for (t,hi,lo,typ) in gaps if typ=="up"   and ts>=t and row["close"] < lo ]
-        mids_down = [ (hi+lo)/2 for (t,hi,lo,typ) in gaps if typ=="down" and ts>=t and row["close"] > hi ]
-        gap_above.append(min(mids_up) if mids_up else np.nan)
-        gap_below.append(max(mids_down) if mids_down else np.nan)
-    df["cme_mid_above"], df["cme_mid_below"] = gap_above, gap_below
 
     # Drop earliest rows until ATR exists
     return df.dropna(subset=["atr"])
@@ -302,47 +290,65 @@ def confluence_signals(df: pd.DataFrame, tol: float = 0.003) -> pd.DataFrame:
     s["golden_long"]  = gp_hit & (df["swing_dir"]==1)  & (df["close"] > df["gp_low"])
     s["golden_short"] = gp_hit & (df["swing_dir"]==-1) & (df["close"] < df["gp_high"])
 
-    # CME target existence (as magnet)
-    s["cme_up"]   = df["cme_mid_above"].notna()
-    s["cme_down"] = df["cme_mid_below"].notna()
-
     return s.fillna(False).astype(bool)
 
 # ----------------- Backtest -----------------
-def backtest(df: pd.DataFrame, sigs: pd.DataFrame) -> pd.Series:
+def backtest(df: pd.DataFrame, sigs: pd.DataFrame, return_details: bool = False):
     """
-    Daily, next-bar execution. Position ∈ {-1, 0, +1}.
+    Daily, next-bar execution. Position in {-1, 0, +1}.
     Stop/target:
       Long: stop = min(VAL, NPOC_below, entry - 1.5*ATR)
-            target = max(VAH, CME_mid_above) or entry + 2*ATR
-      Short: mirrored.
+            target = VAH or entry + 2*ATR
+      Short: mirrored with VAL.
+
     Returns a daily returns Series aligned to df.index[1:].
+    When return_details=True, also returns a DataFrame describing positions,
+    entry/exit events, and the executed prices.
     """
     pos = 0
     entry_px = stop_px = target_px = None
-    rets = []
+    rets: list[float] = []
+    pos_hist: list[int] = []
+    entry_flags: list[int] = []
+    exit_flags: list[int] = []
+    entry_prices: list[float] = []
+    exit_prices: list[float] = []
 
     for i in range(1, len(df)):
-        y, t = df.iloc[i-1], df.iloc[i]          # decide on y, execute on t
-        sy   = sigs.iloc[i-1]
-        atr  = y["atr"]
+        y, t = df.iloc[i - 1], df.iloc[i]  # decide on y, execute on t
+        sy = sigs.iloc[i - 1]
+        atr = y["atr"]
 
         # evaluate exit if in position on today's range
         if pos != 0 and stop_px is not None and target_px is not None:
-            hit_stop = (t["low"] <= stop_px) if pos>0 else (t["high"] >= stop_px)
-            hit_tgt  = (t["high"] >= target_px) if pos>0 else (t["low"] <= target_px)
+            hit_stop = (t["low"] <= stop_px) if pos > 0 else (t["high"] >= stop_px)
+            hit_tgt = (t["high"] >= target_px) if pos > 0 else (t["low"] <= target_px)
             if hit_stop or hit_tgt:
                 exit_px = stop_px if hit_stop else target_px
                 pnl = (exit_px / entry_px - 1.0) * pos
                 rets.append(pnl - COST)
-                pos = 0; entry_px = stop_px = target_px = None
+                pos = 0
+                entry_px = stop_px = target_px = None
+                pos_hist.append(pos)
+                entry_flags.append(0)
+                exit_flags.append(1)
+                entry_prices.append(float("nan"))
+                exit_prices.append(float(exit_px))
                 continue
 
         # build confluence scores
-        long_score = int(sy["touch_npoc_long"])  + int(sy["avwap_support"]) + int(sy["reenter_value_long"]) \
-                   + int(sy["golden_long"])     + int(sy["cme_up"])
-        short_score = int(sy["touch_npoc_short"]) + int(sy["avwap_resist"]) + int(sy["reenter_value_short"]) \
-                    + int(sy["golden_short"])    + int(sy["cme_down"])
+        long_score = (
+            int(sy["touch_npoc_long"])
+            + int(sy["avwap_support"])
+            + int(sy["reenter_value_long"])
+            + int(sy["golden_long"])
+        )
+        short_score = (
+            int(sy["touch_npoc_short"])
+            + int(sy["avwap_resist"])
+            + int(sy["reenter_value_short"])
+            + int(sy["golden_short"])
+        )
 
         # entries when flat
         if pos == 0:
@@ -350,43 +356,82 @@ def backtest(df: pd.DataFrame, sigs: pd.DataFrame) -> pd.Series:
                 pos = +1
                 entry_px = float(t["open"])  # next bar open
                 structural = []
-                if np.isfinite(y["val"]): structural.append(float(y["val"]))
-                if np.isfinite(y["npoc_below"]): structural.append(float(y["npoc_below"]))
+                if np.isfinite(y["val"]):
+                    structural.append(float(y["val"]))
+                if np.isfinite(y["npoc_below"]):
+                    structural.append(float(y["npoc_below"]))
                 if structural:
-                    stop_px = min(min(structural), entry_px - ATR_STOP_MULT*atr)
+                    stop_px = min(min(structural), entry_px - ATR_STOP_MULT * atr)
                 else:
-                    stop_px = entry_px - ATR_STOP_MULT*atr
+                    stop_px = entry_px - ATR_STOP_MULT * atr
                 t_candidates = []
-                if np.isfinite(y["vah"]): t_candidates.append(float(y["vah"]))
-                if np.isfinite(y["cme_mid_above"]): t_candidates.append(float(y["cme_mid_above"]))
-                target_px = max(t_candidates) if t_candidates else entry_px + 2*atr
+                if np.isfinite(y["vah"]):
+                    t_candidates.append(float(y["vah"]))
+                target_px = max(t_candidates) if t_candidates else entry_px + 2 * atr
                 rets.append(0.0)
+                pos_hist.append(pos)
+                entry_flags.append(1)
+                exit_flags.append(0)
+                entry_prices.append(float(entry_px))
+                exit_prices.append(float("nan"))
                 continue
 
             if short_score >= ENTRY_SCORE and np.isfinite(y["vah"]):
                 pos = -1
                 entry_px = float(t["open"])
                 structural = []
-                if np.isfinite(y["vah"]): structural.append(float(y["vah"]))
-                if np.isfinite(y["npoc_above"]): structural.append(float(y["npoc_above"]))
+                if np.isfinite(y["vah"]):
+                    structural.append(float(y["vah"]))
+                if np.isfinite(y["npoc_above"]):
+                    structural.append(float(y["npoc_above"]))
                 if structural:
-                    stop_px = max(max(structural), entry_px + ATR_STOP_MULT*atr)
+                    stop_px = max(max(structural), entry_px + ATR_STOP_MULT * atr)
                 else:
-                    stop_px = entry_px + ATR_STOP_MULT*atr
+                    stop_px = entry_px + ATR_STOP_MULT * atr
                 t_candidates = []
-                if np.isfinite(y["val"]): t_candidates.append(float(y["val"]))
-                if np.isfinite(y["cme_mid_below"]): t_candidates.append(float(y["cme_mid_below"]))
-                target_px = min(t_candidates) if t_candidates else entry_px - 2*atr
+                if np.isfinite(y["val"]):
+                    t_candidates.append(float(y["val"]))
+                target_px = min(t_candidates) if t_candidates else entry_px - 2 * atr
                 rets.append(0.0)
+                pos_hist.append(pos)
+                entry_flags.append(1)
+                exit_flags.append(0)
+                entry_prices.append(float(entry_px))
+                exit_prices.append(float("nan"))
                 continue
 
             rets.append(0.0)
+            pos_hist.append(pos)
+            entry_flags.append(0)
+            exit_flags.append(0)
+            entry_prices.append(float("nan"))
+            exit_prices.append(float("nan"))
         else:
             # mark-to-market while in position (no extra turnover unless exit/flip)
             day_ret = (t["close"] / y["close"] - 1.0) * pos
             rets.append(day_ret)
+            pos_hist.append(pos)
+            entry_flags.append(0)
+            exit_flags.append(0)
+            entry_prices.append(float("nan"))
+            exit_prices.append(float("nan"))
 
-    return pd.Series(rets, index=df.index[1:], name="ret")
+    ret_series = pd.Series(rets, index=df.index[1:], name="ret")
+
+    if not return_details:
+        return ret_series
+
+    detail = pd.DataFrame(
+        {
+            "pos": pos_hist,
+            "entry_flag": entry_flags,
+            "exit_flag": exit_flags,
+            "entry_price": entry_prices,
+            "exit_price": exit_prices,
+        },
+        index=df.index[1:],
+    )
+    return ret_series, detail
 
 # ----------------- Stats & Run -----------------
 def stats_ser(r: pd.Series) -> pd.Series:
@@ -412,7 +457,7 @@ def run():
     print(f"Rows: {len(df):,}  Start: {df.index[0].date()}  End: {df.index[-1].date()}")
     print("\n=== BTC Confluence Strategy ===")
     print(f"In-sample (< {SPLIT})");  print(stats_ser(ins).to_frame("Value"))
-    print(f"\nOut-of-sample (≥ {SPLIT})"); print(stats_ser(oos).to_frame("Value"))
+    print(f"\nOut-of-sample (>= {SPLIT})"); print(stats_ser(oos).to_frame("Value"))
 
     # Save artifacts
     (1 + r).cumprod().to_frame("Equity").to_csv("btc_confluence_equity.csv")
