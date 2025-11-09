@@ -1,1 +1,11 @@
+venv/
 .env
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+node_modules/
+dist/
+*.log
+*.map
+.DS_Store
