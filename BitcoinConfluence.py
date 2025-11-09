@@ -1,472 +1,393 @@
-# BitcoinConfluence.py
-# deps: pip install -U pandas numpy scipy matplotlib
-
-import math
-import warnings
-from datetime import datetime
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
+# btc_confluence_250d.py
+import math, warnings, numpy as np, pandas as pd
+import ccxt, yfinance as yf
 from scipy.signal import argrelextrema
-
+from datetime import datetime
 warnings.filterwarnings("ignore")
 
-# ----------------- Parameters -----------------
-START  = "2017-01-01"     # earliest date we attempt to load from cached Binance data
+# ----------------- Params -----------------
+START  = "2017-01-01"     # CME starts 2017; feel free to push earlier for spot
 END    = None
-SPLIT  = "2021-01-01"     # In-sample / Out-of-sample split (edit as you like)
-
-CTX    = 250              # bars for volume profile (≈ 1y of daily bars)
+SPLIT  = "2021-01-01"     # IS/OOS split (edit freely)
+CTX    = 250              # context window for volume profile (≈ 1Y of trading days)
 VA_PCT = 0.70             # value area percent
-
 FEE    = 0.0005           # fee per side
 SLIP   = 0.0005           # slippage per side
 COST   = FEE + SLIP
 
-SWING_WIN   = 60          # days to detect last swing high/low
-ATR_WIN     = 14
-ENTRY_SCORE = 2           # confluence needed to enter (sum of booleans)
-ATR_STOP_MULT = 1.5       # stop distance in ATR if structural stop not available
-
-if "__file__" in globals():
-    _BASE_DIR = Path(__file__).resolve().parent
-else:
-    _BASE_DIR = Path.cwd()
-DATA_DIR = _BASE_DIR / "data"
-TIMEFRAME_DIRS = {
-    "1d": DATA_DIR,
-    "1h": _BASE_DIR / "data_1h",
-    "4h": _BASE_DIR / "data_4h",
-}
-
+SWING_WIN = 60            # lookback to find last swing H/L for anchors
+ATR_WIN   = 14
+ENTRY_SCORE = 3           # confluence needed to enter
+RISK_R    = 1.0           # risk per trade in R units (position sizing here is 1x notional; you can adapt)
 
 # ----------------- Data -----------------
-def fetch_binance_daily(symbols: list[str], timeframe: str = "1d") -> pd.DataFrame:
-    """
-    Load daily OHLCV from cached CSVs produced by fetch_binance_top10.py.
-    Returns DataFrame with MultiIndex columns: (symbol, field).
-    """
-    tf_dir = TIMEFRAME_DIRS.get(timeframe)
-    if tf_dir is None:
-        raise ValueError(f"Unsupported timeframe '{timeframe}'. Available: {', '.join(TIMEFRAME_DIRS)}")
-    frames: list[pd.DataFrame] = []
+
+
+def fetch_bybit_daily(symbols):
+    ex = ccxt.bybit({"enableRateLimit": True})
+    ex.load_markets()
+    frames = []
     for sym in symbols:
-        csv_name = sym.replace("/", "") + ".csv"
-        path = tf_dir / csv_name
-        if not path.exists():
-            raise FileNotFoundError(f"Cached data not found for {sym}. Expected file: {path}")
-        df = pd.read_csv(path, parse_dates=["open_time"])
-        df = df.rename(columns=str.lower)
-        df.set_index("open_time", inplace=True)
+        if sym not in ex.markets:
+            continue
+        ohlcv = ex.fetch_ohlcv(sym, timeframe="1d", since=None, limit=2000)
+        if not ohlcv:
+            continue
+
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+
+        # robust epoch handling (ms vs s)
+        unit = "ms" if df["ts"].max() > 10**12 else "s"
+        df["ts"] = pd.to_datetime(df["ts"], unit=unit, utc=True)
+
+        # make it the index first, THEN tz_convert on the index
+        df.set_index("ts", inplace=True)
         if getattr(df.index, "tz", None) is not None:
-            df.index = df.index.tz_convert("UTC").tz_localize(None)
-        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+            df.index = df.index.tz_convert(None)  # tz-aware -> tz-naive
+
+        # multiindex columns per symbol
         df.columns = pd.MultiIndex.from_product([[sym], df.columns])
         frames.append(df)
-        print(f"[cache] Loaded {sym} ({timeframe}) from {path}")
 
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, axis=1).sort_index()
 
-def pick_btc_symbol(exframe: pd.DataFrame) -> str:
-    """Prefer USD perp; else USD spot; else USDT."""
-    candidates = ["BTC/USDT", "BTC/BUSD", "BTC/USDC", "BTC/FDUSD"]
-    for c in candidates:
-        if (c, "close") in exframe.columns:
-            return c
-    # fallback to any BTC/* we found
-    symbols = list({c[0] for c in exframe.columns})
-    for s in symbols:
-        if s.startswith("BTC/"):
-            return s
-    raise RuntimeError("No BTC symbols found in Binance data.")
+
+
+def pick_spot_from_bybit(exframe):
+    # Prefer USD perp, else linear, else anything crypto/USD/USDT we got
+    for cand in ["BTC/USD:USD","BTC/USD","BTC/USDT"]:
+        if (cand, "close") in exframe.columns:
+            return cand
+    # fallback to any BTC/* symbol
+    for col in exframe.columns.get_level_values(0).unique():
+        if col.startswith("BTC/"):
+            return col
+    raise RuntimeError("No BTC symbol found in Bybit data.")
+
+def get_cme_daily(start, end):
+    # Yahoo CME Bitcoin futures
+    df = yf.download("BTC=F", start=start, end=end, auto_adjust=True, progress=False)
+    if df.empty:
+        raise RuntimeError("Could not fetch BTC=F from Yahoo for CME gaps.")
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    return df.rename(columns=str.lower)
 
 # ----------------- Indicators -----------------
-def rolling_atr(df: pd.DataFrame, win: int = ATR_WIN) -> pd.Series:
-    """Pandas-native ATR (no numpy arrays)."""
+def rolling_atr(df, win=14):
     high, low, close = df["high"], df["low"], df["close"]
     tr = pd.concat([
         (high - low),
         (high - close.shift()).abs(),
-        (low  - close.shift()).abs(),
+        (low  - close.shift()).abs()
     ], axis=1).max(axis=1)
     return tr.rolling(win, min_periods=1).mean()
 
-def volume_profile(ctx_close: pd.Series, ctx_vol: pd.Series, bins: int = CTX, va_pct: float = VA_PCT):
-    """
-    Simple close-price/volume histogram profile over context window.
-    Returns POC, VAL, VAH, centers, hist.
-    """
+
+def volume_profile(ctx_close, ctx_vol, bins=CTX, va_pct=VA_PCT):
     lo, hi = ctx_close.min(), ctx_close.max()
-    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
-        centers = np.array([float(lo)])
-        hist = np.array([float(ctx_vol.sum())])
-        poc_px = float(lo)
+    if lo == hi: 
+        p_bins = np.array([lo, lo+1e-9])
+        hist = np.array([ctx_vol.sum()])
+        centers = np.array([lo])
+    else:
+        p_bins = np.linspace(lo, hi, bins+1)
+        hist, edges = np.histogram(ctx_close, bins=p_bins, weights=ctx_vol)
+        centers = (edges[:-1] + edges[1:]) / 2
+    # POC
+    poc_px = centers[hist.argmax()]
+    # Value area: smallest symmetric band around POC covering va_pct of volume
+    tot = hist.sum()
+    if tot == 0: 
         return poc_px, np.nan, np.nan, centers, hist
-
-    edges = np.linspace(lo, hi, bins + 1)
-    hist, edges = np.histogram(ctx_close.values, bins=edges, weights=ctx_vol.values)
-    centers = (edges[:-1] + edges[1:]) / 2.0
-
-    if hist.sum() <= 0:
-        return float(centers[0]), np.nan, np.nan, centers, hist
-
-    poc_px = float(centers[hist.argmax()])
-
-    # build symmetric VA around POC covering va_pct of volume
-    idx = int(hist.argmax())
-    L = R = idx
+    idx = hist.argmax()
     cum = hist[idx]
-    total = hist.sum()
-    while cum < va_pct * total and (L > 0 or R < len(hist) - 1):
-        left = hist[L - 1] if L > 0 else -np.inf
-        right = hist[R + 1] if R < len(hist) - 1 else -np.inf
+    L, R = idx, idx
+    while cum < va_pct * tot and (L > 0 or R < len(hist)-1):
+        left  = hist[L-1] if L>0 else -np.inf
+        right = hist[R+1] if R<len(hist)-1 else -np.inf
         if right >= left:
             R += 1; cum += hist[R]
         else:
             L -= 1; cum += hist[L]
-    VAL = float(centers[L])
-    VAH = float(centers[R])
-    return poc_px, VAL, VAH, centers, hist
+    val = centers[L]; vah = centers[R]
+    return float(poc_px), float(val), float(vah), centers, hist
 
-def detect_npocs(poc: pd.Series, high: pd.Series, low: pd.Series, ref_close: pd.Series) -> tuple[pd.Series, pd.Series]:
+def detect_npocs(poc_series, high, low):
     """
-    NPOCs using daily bars:
-      - Yesterday's POC becomes 'open' from today.
-      - Remove an open POC as soon as today's [low, high] trades through it.
-      - For each day, return nearest open NPOC strictly above/below today's **close**.
+    An NPOC forms on day t at price P if later days never traded through P.
+    We mark it as 'open' until touched (low<=P<=high), then it's removed.
+    We return a series with the nearest open NPOC above/below each day.
     """
-    idx = poc.index
-    open_levels: list[float] = []
-    npoc_above = np.full(len(idx), np.nan, dtype=float)
-    npoc_below = np.full(len(idx), np.nan, dtype=float)
-
-    prev_p = np.nan
-    for i in range(len(idx)):
-        lo = float(low.iloc[i]); hi = float(high.iloc[i]); c = float(ref_close.iloc[i])
-
-        # remove filled levels
+    open_levels = []  # (price, day_index)
+    near_up, near_dn = [], []
+    for i in range(len(poc_series)):
+        p = poc_series.iloc[i]
+        # resolve touches
+        price_low, price_high = low.iloc[i], high.iloc[i]
+        open_levels = [(lvl, day) for (lvl, day) in open_levels if not (price_low <= lvl <= price_high)]
+        # add today's POC (yesterday's POC becomes candidate)
+        if not np.isnan(p):
+            open_levels.append((p, i))
+        # nearest above/below for today
         if open_levels:
-            open_levels = [lvl for lvl in open_levels if not (lo <= lvl <= hi)]
-
-        # add yesterday's poc
-        if np.isfinite(prev_p):
-            open_levels.append(float(prev_p))
-
-        # record nearest above/below
-        if open_levels:
-            above = [lvl for lvl in open_levels if lvl > c]
-            below = [lvl for lvl in open_levels if lvl < c]
-            npoc_above[i] = min(above) if above else np.nan
-            npoc_below[i] = max(below) if below else np.nan
+            diffs = np.array([lvl - poc_series.index[i]*0 + 0 for lvl,_ in open_levels])  # dummy just to keep structure
+            prices = np.array([lvl for (lvl,_) in open_levels])
+            above = prices[prices >= low.iloc[i]]
+            below = prices[prices <= high.iloc[i]]
+        # compute nearest levels
+        lvls = np.array([lvl for (lvl,_) in open_levels]) if open_levels else np.array([])
+        if lvls.size:
+            na = lvls[lvls >= low.iloc[i]]
+            nb = lvls[lvls <= high.iloc[i]]
         else:
-            npoc_above[i] = np.nan
-            npoc_below[i] = np.nan
+            na, nb = np.array([]), np.array([])"/l"
+        near_up.append(na.min() if na.size else np.nan)
+        near_dn.append(nb.max() if nb.size else np.nan)
+    return pd.Series(near_up, index=poc_series.index, name="npoc_above"), \
+           pd.Series(near_dn, index=poc_series.index, name="npoc_below")
 
-        # store today's poc for tomorrow
-        prev_p = float(poc.iloc[i]) if np.isfinite(poc.iloc[i]) else np.nan
-
-    return pd.Series(npoc_above, index=idx, name="npoc_above"), pd.Series(npoc_below, index=idx, name="npoc_below")
-
-def last_swings(df: pd.DataFrame, win: int = SWING_WIN) -> tuple[int, int]:
-    """Indices of last swing low and last swing high using local extrema."""
-    h = df["high"].values; l = df["low"].values
-    highs = argrelextrema(h, np.greater_equal, order=win)[0]
-    lows  = argrelextrema(l, np.less_equal,   order=win)[0]
-    hi_idx = int(highs[-1]) if len(highs) else int(np.argmax(h))
-    lo_idx = int(lows[-1])  if len(lows)  else int(np.argmin(l))
-    return lo_idx, hi_idx
-
-def anchored_vwap(close: pd.Series, vol: pd.Series, anchor_idx: int) -> pd.Series:
-    """AVWAP anchored at anchor_idx (inclusive)."""
+def anchored_vwap(close, vol, anchor_idx):
+    """Classic cumulative PV / V anchored at index anchor_idx."""
     pv = (close * vol).copy()
+    pv.iloc[:anchor_idx] = 0
     v  = vol.copy()
-    pv.iloc[:anchor_idx] = 0.0
-    v.iloc[:anchor_idx] = 0.0
+    v.iloc[:anchor_idx] = 0
     vw = pv.cumsum() / v.cumsum()
     vw.iloc[:anchor_idx] = np.nan
     return vw
 
-def golden_pocket_from_swing(lo_px: float, hi_px: float, uptrend: bool) -> tuple[float, float]:
-    """Return (gp_low, gp_high) bounds for the 61.8–65% retracement."""
-    hi, lo = (hi_px, lo_px)
+def last_swings(df, win=SWING_WIN):
+    """Return indices of last swing low and last swing high using rolling local extrema."""
+    h = df["high"].values; l = df["low"].values
+    # local extrema
+    highs = argrelextrema(h, np.greater_equal, order=win)[0]
+    lows  = argrelextrema(l, np.less_equal,   order=win)[0]
+    hi_idx = highs[-1] if len(highs) else np.argmax(h)
+    lo_idx = lows[-1]  if len(lows)  else np.argmin(l)
+    return int(lo_idx), int(hi_idx)
+
+def golden_pocket(level_a, level_b):
+    """Return (fib_618, fib_65) between two prices."""
+    hi, lo = max(level_a, level_b), min(level_a, level_b)
     span = hi - lo
-    if uptrend:
-        # pullback in uptrend measured from hi → lo
-        gp_low  = hi - 0.65 * span
-        gp_high = hi - 0.618 * span
-    else:
-        gp_low  = lo + 0.618 * span
-        gp_high = lo + 0.65  * span
-    return float(min(gp_low, gp_high)), float(max(gp_low, gp_high))
+    return hi - 0.618*span, hi - 0.65*span  # for pullback to an up-move
+# For down-move, logic mirrored in code.
+
+def cme_unfilled_gaps(cme_df):
+    """Return list of gaps (start_date, hi_gap, lo_gap) that remain unfilled till later."""
+    gaps = []
+    for i in range(1, len(cme_df)):
+        prev = cme_df.iloc[i-1]; cur = cme_df.iloc[i]
+        # gap up if cur.low > prev.high; gap down if cur.high < prev.low
+        if cur["low"] > prev["high"]:
+            gaps.append((cme_df.index[i], prev["high"], cur["low"], "up"))
+        elif cur["high"] < prev["low"]:
+            gaps.append((cme_df.index[i], cur["high"], prev["low"], "down"))
+    # we do NOT mark fills here; in backtest we check if spot traded into gap
+    return gaps
 
 # ----------------- Build feature set -----------------
-def build_btc_frame(timeframe: str = "1d") -> pd.DataFrame:
-    # try Binance USD spot variations (only those cached locally)
-    preferred = ["BTC/USDT", "BTC/BUSD", "BTC/USDC", "BTC/FDUSD"]
-    data_dir = TIMEFRAME_DIRS.get(timeframe)
-    if data_dir is None:
-        raise ValueError(f"Unsupported timeframe '{timeframe}'. Available: {', '.join(TIMEFRAME_DIRS)}")
-    available = [s for s in preferred if (data_dir / (s.replace("/", "") + ".csv")).exists()]
-    if not available:
-        raise RuntimeError(f"No cached Binance data found for BTC in {data_dir}. Run fetch_binance_top10.py first.")
-    binance = fetch_binance_daily(available, timeframe=timeframe)
-    if binance.empty:
-        raise RuntimeError("Cached Binance data for BTC returned empty frame.")
-    sym = pick_btc_symbol(binance)
-    df = binance[sym].copy()
+def build_btc_frame():
+    bybit = fetch_bybit_daily(["BTC/USD:USD","BTC/USD","BTC/USDT"])
+    if bybit.empty: 
+        raise RuntimeError("Bybit data not available via ccxt.")
+    sym = pick_spot_from_bybit(bybit)
+    df = bybit[sym].copy()
     df = df.loc[df.index >= pd.Timestamp(START)]
     if END:
         df = df.loc[df.index <= pd.Timestamp(END)]
-    df = df.rename(columns=str)  # ensure 'open','high','low','close','volume' as strings
-
-    # Ensure correct column order
-    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df.columns = ["open","high","low","close","volume"]
 
     # ATR
-    df["atr"] = rolling_atr(df, ATR_WIN)
+    df["atr"] = rolling_atr(df)
 
-    # Rolling volume profile POC/VAL/VAH
+    # rolling volume profile POC/VAL/VAH
     poc, val, vah = [], [], []
     for i in range(len(df)):
-        j0 = max(0, i - CTX + 1)
+        j0 = max(0, i-CTX+1)
         ctx = df.iloc[j0:i+1]
-        p_, vL_, vH_, _, _ = volume_profile(ctx["close"], ctx["volume"], bins=CTX, va_pct=VA_PCT)
-        poc.append(p_); val.append(vL_); vah.append(vH_)
+        p, vL, vH, _, _ = volume_profile(ctx["close"], ctx["volume"], bins=CTX, va_pct=VA_PCT)
+        poc.append(p); val.append(vL); vah.append(vH)
     df["poc"], df["val"], df["vah"] = poc, val, vah
 
-    # NPOCs (use close as reference for "nearest above/below")
-    npoc_up, npoc_dn = detect_npocs(df["poc"], df["high"], df["low"], df["close"])
+    # NPOCs
+    npoc_up, npoc_dn = detect_npocs(df["poc"], df["high"], df["low"])
     df["npoc_above"], df["npoc_below"] = npoc_up, npoc_dn
 
-    # Swings & Anchored VWAPs
-    lo_i, hi_i = last_swings(df, SWING_WIN)
+    # swings and anchored VWAPs
+    lo_i, hi_i = last_swings(df)
     df["avwap_from_lo"] = anchored_vwap(df["close"], df["volume"], lo_i)
     df["avwap_from_hi"] = anchored_vwap(df["close"], df["volume"], hi_i)
 
-    # Golden pocket
-    lo_px, hi_px = float(df.iloc[lo_i]["low"]), float(df.iloc[hi_i]["high"])
-    uptrend = hi_i > lo_i
-    gp_low, gp_high = golden_pocket_from_swing(lo_px, hi_px, uptrend)
-    df["gp_low"], df["gp_high"], df["swing_dir"] = gp_low, gp_high, (1 if uptrend else -1)
+    # golden pockets from active swing
+    lo_px, hi_px = df.iloc[lo_i]["low"], df.iloc[hi_i]["high"]
+    if hi_i > lo_i:
+        gp_lo, gp_hi = golden_pocket(hi_px, lo_px)  # pullback in uptrend
+        df["gp_low"], df["gp_high"], df["swing_dir"] = gp_hi, gp_lo, 1
+    else:
+        # downtrend pullback
+        span = hi_px - lo_px
+        gp_l = lo_px + 0.618*span
+        gp_h = lo_px + 0.65*span
+        df["gp_low"], df["gp_high"], df["swing_dir"] = gp_l, gp_h, -1
 
-    # Daily prev levels
+    # D/W/M levels
     d_prev = df.shift(1)
     df["y_high"], df["y_low"], df["y_open"] = d_prev["high"], d_prev["low"], d_prev["open"]
-
-    # Weekly (Fri close week)
+    # weekly
     wk = df.resample("W-FRI").agg({"open":"first","high":"max","low":"min","close":"last"})
     for col in ["open","high","low","close"]:
         df[f"w_{col}"] = wk[col].shift().reindex(df.index).ffill()
-
-    # Monthly (month-end)
-    mo = df.resample("M").agg({"open":"first","high":"max","low":"min","close":"last"})
+    # monthly
+    mo = df.resample("ME").agg({"open":"first","high":"max","low":"min","close":"last"})
     for col in ["open","high","low","close"]:
         df[f"m_{col}"] = mo[col].shift().reindex(df.index).ffill()
 
-    # Drop earliest rows until ATR exists
+    # CME gaps
+    cme = get_cme_daily(START, END)
+    gaps = cme_unfilled_gaps(cme)
+    # nearest gap above/below each day (by mid-gap)
+    gap_above = []; gap_below = []
+    for ts, row in df.iterrows():
+        mids_up   = [ (hi+lo)/2 for (t,hi,lo,typ) in gaps if typ=="up"   and ts>=t and row["close"] < lo ]
+        mids_down = [ (hi+lo)/2 for (t,hi,lo,typ) in gaps if typ=="down" and ts>=t and row["close"] > hi ]
+        gap_above.append(min(mids_up) if mids_up else np.nan)
+        gap_below.append(max(mids_down) if mids_down else np.nan)
+    df["cme_mid_above"], df["cme_mid_below"] = gap_above, gap_below
+
     return df.dropna(subset=["atr"])
 
-# ----------------- Signals (confluence) -----------------
-def confluence_signals(df: pd.DataFrame, tol: float = 0.003) -> pd.DataFrame:
+# ----------------- Confluence & Rules -----------------
+def confluence_signals(df, tol=0.003):
+    """
+    Create binary signals used in scoring:
+      - touch_npoc_reject_[long/short]
+      - avwap_support/resistance
+      - reenter_value_[long/short] (VAL/VAH)
+      - golden_pocket_hit_[long/short]
+      - cme_target_[up/down] exists
+    """
     s = pd.DataFrame(index=df.index)
 
-    # NPOC touch & reject
-    s["touch_npoc_long"]  = df["npoc_below"].notna() & (df["low"]  <= df["npoc_below"]*(1+tol)) & (df["close"] > df["npoc_below"])
-    s["touch_npoc_short"] = df["npoc_above"].notna() & (df["high"] >= df["npoc_above"]*(1-tol)) & (df["close"] < df["npoc_above"])
+    # NPOC touches and reject
+    s["touch_npoc_long"]  = (df["low"]  <= df["npoc_below"]*(1+tol)) & (df["close"] > df["npoc_below"])
+    s["touch_npoc_short"] = (df["high"] >= df["npoc_above"]*(1-tol)) & (df["close"] < df["npoc_above"])
 
-    # AVWAP support/resistance
-    s["avwap_support"] = df["avwap_from_lo"].notna() & (df["low"]  <= df["avwap_from_lo"]*(1+tol)) & (df["close"] > df["avwap_from_lo"])
-    s["avwap_resist"]  = df["avwap_from_hi"].notna() & (df["high"] >= df["avwap_from_hi"]*(1-tol)) & (df["close"] < df["avwap_from_hi"])
+    # Anchored VWAP support/resistance (from last swing)
+    s["avwap_support"]    = (df["low"]  <= df["avwap_from_lo"]*(1+tol)) & (df["close"] > df["avwap_from_lo"])
+    s["avwap_resist"]     = (df["high"] >= df["avwap_from_hi"]*(1-tol)) & (df["close"] < df["avwap_from_hi"])
 
     # Value area re-entries
-    s["reenter_value_long"]  = df["val"].notna() & (df["close"].shift(1) < df["val"].shift(1)) & (df["close"] > df["val"])
-    s["reenter_value_short"] = df["vah"].notna() & (df["close"].shift(1) > df["vah"].shift(1)) & (df["close"] < df["vah"])
+    s["reenter_value_long"]  = (df["close"].shift(1) < df["val"].shift(1)) & (df["close"] > df["val"])
+    s["reenter_value_short"] = (df["close"].shift(1) > df["vah"].shift(1)) & (df["close"] < df["vah"])
 
-    # Golden pocket (directional)
-    gp_hit = df["gp_low"].notna() & df["gp_high"].notna() & (df["low"] <= df["gp_high"]) & (df["high"] >= df["gp_low"])
-    s["golden_long"]  = gp_hit & (df["swing_dir"]==1)  & (df["close"] > df["gp_low"])
+    # Golden pocket touches relative to swing direction
+    gp_hit = (df["low"] <= df["gp_high"]) & (df["high"] >= df["gp_low"])
+    s["golden_long"]  = gp_hit & (df["swing_dir"]==1) & (df["close"] > df["gp_low"])
     s["golden_short"] = gp_hit & (df["swing_dir"]==-1) & (df["close"] < df["gp_high"])
+
+    # CME targets exist
+    s["cme_up"]   = df["cme_mid_above"].notna()
+    s["cme_down"] = df["cme_mid_below"].notna()
 
     return s.fillna(False).astype(bool)
 
-# ----------------- Backtest -----------------
-def backtest(df: pd.DataFrame, sigs: pd.DataFrame, return_details: bool = False):
-    """
-    Daily, next-bar execution. Position in {-1, 0, +1}.
-    Stop/target:
-      Long: stop = min(VAL, NPOC_below, entry - 1.5*ATR)
-            target = VAH or entry + 2*ATR
-      Short: mirrored with VAL.
-
-    Returns a daily returns Series aligned to df.index[1:].
-    When return_details=True, also returns a DataFrame describing positions,
-    entry/exit events, and the executed prices.
-    """
-    pos = 0
+def backtest(df, sigs):
+    """Daily next-bar execution with ATR stop and target to nearest structural level / CME mid."""
+    pos = 0  # -1, 0, +1
     entry_px = stop_px = target_px = None
-    rets: list[float] = []
-    pos_hist: list[int] = []
-    entry_flags: list[int] = []
-    exit_flags: list[int] = []
-    entry_prices: list[float] = []
-    exit_prices: list[float] = []
-
+    rets = []
     for i in range(1, len(df)):
-        y, t = df.iloc[i - 1], df.iloc[i]  # decide on y, execute on t
-        sy = sigs.iloc[i - 1]
-        atr = y["atr"]
+        row_y, row = df.iloc[i-1], df.iloc[i]   # decide using yesterday's info, execute today
+        sig_y = sigs.iloc[i-1]
+        atr = row_y["atr"]
 
-        # evaluate exit if in position on today's range
+        # Build confluence scores
+        long_score = sum([
+            sig_y["touch_npoc_long"], sig_y["avwap_support"],
+            sig_y["reenter_value_long"], sig_y["golden_long"],
+            sig_y["cme_up"]
+        ])
+        short_score = sum([
+            sig_y["touch_npoc_short"], sig_y["avwap_resist"],
+            sig_y["reenter_value_short"], sig_y["golden_short"],
+            sig_y["cme_down"]
+        ])
+
+        # exits on stop/target
         if pos != 0 and stop_px is not None and target_px is not None:
-            hit_stop = (t["low"] <= stop_px) if pos > 0 else (t["high"] >= stop_px)
-            hit_tgt = (t["high"] >= target_px) if pos > 0 else (t["low"] <= target_px)
+            # intraday stop/target on today's range (approx with close location)
+            hit_stop  = (row["low"] <= stop_px) if pos>0 else (row["high"] >= stop_px)
+            hit_tgt   = (row["high"] >= target_px) if pos>0 else (row["low"] <= target_px)
             if hit_stop or hit_tgt:
                 exit_px = stop_px if hit_stop else target_px
-                pnl = (exit_px / entry_px - 1.0) * pos
+                pnl = (exit_px/entry_px - 1.0) * pos
                 rets.append(pnl - COST)
-                pos = 0
-                entry_px = stop_px = target_px = None
-                pos_hist.append(pos)
-                entry_flags.append(0)
-                exit_flags.append(1)
-                entry_prices.append(float("nan"))
-                exit_prices.append(float(exit_px))
+                pos, entry_px, stop_px, target_px = 0, None, None, None
                 continue
 
-        # build confluence scores
-        long_score = (
-            int(sy["touch_npoc_long"])
-            + int(sy["avwap_support"])
-            + int(sy["reenter_value_long"])
-            + int(sy["golden_long"])
-        )
-        short_score = (
-            int(sy["touch_npoc_short"])
-            + int(sy["avwap_resist"])
-            + int(sy["reenter_value_short"])
-            + int(sy["golden_short"])
-        )
-
-        # entries when flat
+        # if flat, consider entries
         if pos == 0:
-            if long_score >= ENTRY_SCORE and np.isfinite(y["val"]):
+            if long_score >= ENTRY_SCORE and not np.isnan(row_y["val"]):
                 pos = +1
-                entry_px = float(t["open"])  # next bar open
-                structural = []
-                if np.isfinite(y["val"]):
-                    structural.append(float(y["val"]))
-                if np.isfinite(y["npoc_below"]):
-                    structural.append(float(y["npoc_below"]))
-                if structural:
-                    stop_px = min(min(structural), entry_px - ATR_STOP_MULT * atr)
-                else:
-                    stop_px = entry_px - ATR_STOP_MULT * atr
-                t_candidates = []
-                if np.isfinite(y["vah"]):
-                    t_candidates.append(float(y["vah"]))
-                target_px = max(t_candidates) if t_candidates else entry_px + 2 * atr
-                rets.append(0.0)
-                pos_hist.append(pos)
-                entry_flags.append(1)
-                exit_flags.append(0)
-                entry_prices.append(float(entry_px))
-                exit_prices.append(float("nan"))
-                continue
-
-            if short_score >= ENTRY_SCORE and np.isfinite(y["vah"]):
+                entry_px = row["open"]  # next bar open
+                # Stop a bit beyond VAL or 1.5 ATR below entry
+                structural = min(row_y["val"], row_y["npoc_below"]) if not np.isnan(row_y["npoc_below"]) else row_y["val"]
+                stop_px = min(structural, entry_px - 1.5*atr)
+                # Target: VAH or nearest gap above
+                t_candidates = [x for x in [row_y["vah"], row_y["cme_mid_above"]] if not np.isnan(x)]
+                target_px = max(t_candidates) if t_candidates else entry_px + 2*atr
+            elif short_score >= ENTRY_SCORE and not np.isnan(row_y["vah"]):
                 pos = -1
-                entry_px = float(t["open"])
-                structural = []
-                if np.isfinite(y["vah"]):
-                    structural.append(float(y["vah"]))
-                if np.isfinite(y["npoc_above"]):
-                    structural.append(float(y["npoc_above"]))
-                if structural:
-                    stop_px = max(max(structural), entry_px + ATR_STOP_MULT * atr)
-                else:
-                    stop_px = entry_px + ATR_STOP_MULT * atr
-                t_candidates = []
-                if np.isfinite(y["val"]):
-                    t_candidates.append(float(y["val"]))
-                target_px = min(t_candidates) if t_candidates else entry_px - 2 * atr
-                rets.append(0.0)
-                pos_hist.append(pos)
-                entry_flags.append(1)
-                exit_flags.append(0)
-                entry_prices.append(float(entry_px))
-                exit_prices.append(float("nan"))
-                continue
-
+                entry_px = row["open"]
+                structural = max(row_y["vah"], row_y["npoc_above"]) if not np.isnan(row_y["npoc_above"]) else row_y["vah"]
+                stop_px = max(structural, entry_px + 1.5*atr)
+                t_candidates = [x for x in [row_y["val"], row_y["cme_mid_below"]] if not np.isnan(x)]
+                target_px = min(t_candidates) if t_candidates else entry_px - 2*atr
             rets.append(0.0)
-            pos_hist.append(pos)
-            entry_flags.append(0)
-            exit_flags.append(0)
-            entry_prices.append(float("nan"))
-            exit_prices.append(float("nan"))
         else:
-            # mark-to-market while in position (no extra turnover unless exit/flip)
-            day_ret = (t["close"] / y["close"] - 1.0) * pos
-            rets.append(day_ret)
-            pos_hist.append(pos)
-            entry_flags.append(0)
-            exit_flags.append(0)
-            entry_prices.append(float("nan"))
-            exit_prices.append(float("nan"))
+            # manage open position: simple daily mark-to-market
+            day_ret = (row["close"]/df.iloc[i-1]["close"] - 1.0) * pos
+            rets.append(day_ret - COST*abs(pos!=0)*0.0)  # no extra turnover unless flip/close
 
-    ret_series = pd.Series(rets, index=df.index[1:], name="ret")
+    r = pd.Series(rets, index=df.index[1:])
+    return r
 
-    if not return_details:
-        return ret_series
-
-    detail = pd.DataFrame(
-        {
-            "pos": pos_hist,
-            "entry_flag": entry_flags,
-            "exit_flag": exit_flags,
-            "entry_price": entry_prices,
-            "exit_price": exit_prices,
-        },
-        index=df.index[1:],
-    )
-    return ret_series, detail
-
-# ----------------- Stats & Run -----------------
-def stats_ser(r: pd.Series) -> pd.Series:
-    r = r.dropna()
-    if r.empty:
-        return pd.Series({"Total Return": np.nan, "CAGR": np.nan, "Sharpe": np.nan, "MaxDD": np.nan})
-    ann = 252
-    eq = (1 + r).cumprod()
-    total = float(eq.iloc[-1] - 1)
-    cagr  = float((1 + r).prod() ** (ann / len(r)) - 1)
-    sharpe = float(np.sqrt(ann) * r.mean() / (r.std() + 1e-12))
-    mdd   = float((eq / eq.cummax() - 1).min())
-    return pd.Series({"Total Return": total, "CAGR": cagr, "Sharpe": sharpe, "MaxDD": mdd})
-
+# ----------------- Run -----------------
 def run():
     df = build_btc_frame()
     sigs = confluence_signals(df)
     r = backtest(df, sigs)
 
-    ins = r.loc[:pd.Timestamp(SPLIT) - pd.Timedelta(days=1)]
+    def stats(x):
+        x = x.dropna()
+        ann = 252
+        eq = (1+x).cumprod()
+        out = {
+            "Total Return": float(eq.iloc[-1]-1),
+            "CAGR": float((1+x).prod()**(ann/len(x))-1) if len(x)>0 else np.nan,
+            "Sharpe": float(np.sqrt(ann)*x.mean()/(x.std()+1e-12)) if x.std()>0 else np.nan,
+            "MaxDD": float((eq/eq.cummax()-1).min()) if len(eq)>0 else np.nan
+        }
+        return pd.Series(out)
+
+    ins = r.loc[:pd.Timestamp(SPLIT)-pd.Timedelta(days=1)]
     oos = r.loc[pd.Timestamp(SPLIT):]
 
     print(f"Rows: {len(df):,}  Start: {df.index[0].date()}  End: {df.index[-1].date()}")
     print("\n=== BTC Confluence Strategy ===")
-    print(f"In-sample (< {SPLIT})");  print(stats_ser(ins).to_frame("Value"))
-    print(f"\nOut-of-sample (>= {SPLIT})"); print(stats_ser(oos).to_frame("Value"))
+    print("In-sample (< {0}):".format(SPLIT));  print(stats(ins).to_frame("Value"))
+    print("\nOut-of-sample (≥ {0}):".format(SPLIT)); print(stats(oos).to_frame("Value"))
 
-    # Save artifacts
-    (1 + r).cumprod().to_frame("Equity").to_csv("btc_confluence_equity.csv")
+    # Save equity + signals
+    equity = (1+r).cumprod()
+    equity.to_frame("Equity").to_csv("btc_confluence_equity.csv")
     sigs.to_csv("btc_confluence_signals.csv")
     df.to_csv("btc_confluence_features.csv")
     print("\nSaved: btc_confluence_equity.csv, btc_confluence_signals.csv, btc_confluence_features.csv")
 
 if __name__ == "__main__":
-    try:
-        run()
-    except Exception as e:
-        import traceback; traceback.print_exc()
+    run()
